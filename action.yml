@@ -1,0 +1,103 @@
+name: 'Portainer Stack Deploy'
+description: >-
+  Update a Portainer stack from a compose file and force a real redeploy
+  (prune + repull). Unlike other actions in the wild, this one actually
+  sends `prune`/`repullImageAndRedeploy` to the Portainer API, so a
+  `:latest`-tagged image genuinely gets re-pulled instead of silently
+  staying on the previous digest.
+author: 'LucasSantos96'
+branding:
+  icon: 'refresh-ccw'
+  color: 'blue'
+
+inputs:
+  portainer-host:
+    description: 'Portainer base URL, e.g. https://portainer.example.com'
+    required: true
+  username:
+    description: 'Portainer username (use a CI-specific account, not the main admin login)'
+    required: true
+  password:
+    description: 'Portainer password'
+    required: true
+  stack-name:
+    description: 'Name of the existing Portainer stack to update'
+    required: true
+  stack-definition:
+    description: 'Path (relative to the workflow working directory) to the compose file to push'
+    required: true
+  endpoint-id:
+    description: 'Portainer environment/endpoint ID. If omitted, uses the ID already associated with the stack.'
+    required: false
+    default: ''
+  prune:
+    description: 'Remove services no longer present in the new stack definition'
+    required: false
+    default: 'true'
+  repull:
+    description: 'Force Portainer to re-pull the image(s) and redeploy, even if the compose text is unchanged'
+    required: false
+    default: 'true'
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Update stack and force redeploy
+      shell: bash
+      env:
+        PORTAINER_HOST: ${{ inputs.portainer-host }}
+        PORTAINER_USERNAME: ${{ inputs.username }}
+        PORTAINER_PASSWORD: ${{ inputs.password }}
+        STACK_NAME: ${{ inputs.stack-name }}
+        STACK_FILE: ${{ inputs.stack-definition }}
+        ENDPOINT_ID_OVERRIDE: ${{ inputs.endpoint-id }}
+        PRUNE: ${{ inputs.prune }}
+        REPULL: ${{ inputs.repull }}
+      run: |
+        set -euo pipefail
+
+        cleanup() {
+          if [ -n "${jwt:-}" ]; then
+            curl -s -X POST "$PORTAINER_HOST/api/auth/logout" -H "Authorization: Bearer $jwt" -o /dev/null || true
+          fi
+        }
+        trap cleanup EXIT
+
+        echo "::group::Logging in to Portainer"
+        jwt=$(curl -sf -X POST "$PORTAINER_HOST/api/auth" \
+          -H "Content-Type: application/json" \
+          -d "$(jq -n --arg u "$PORTAINER_USERNAME" --arg p "$PORTAINER_PASSWORD" '{username:$u,password:$p}')" \
+          | jq -r '.jwt')
+        echo "::endgroup::"
+
+        echo "::group::Looking up stack '$STACK_NAME'"
+        stack=$(curl -sf "$PORTAINER_HOST/api/stacks" -H "Authorization: Bearer $jwt" \
+          | jq -c --arg name "$STACK_NAME" '.[] | select(.Name == $name)')
+
+        if [ -z "$stack" ]; then
+          echo "::error::Stack '$STACK_NAME' not found in Portainer"
+          exit 1
+        fi
+
+        stack_id=$(echo "$stack" | jq -r '.Id')
+        stack_endpoint_id=$(echo "$stack" | jq -r '.EndpointId')
+        endpoint_id="${ENDPOINT_ID_OVERRIDE:-$stack_endpoint_id}"
+        env_json=$(echo "$stack" | jq -c '.Env')
+        echo "Found stack id=$stack_id endpoint=$endpoint_id"
+        echo "::endgroup::"
+
+        echo "::group::Updating stack (prune=$PRUNE, repull=$REPULL)"
+        body=$(jq -n \
+          --rawfile content "$STACK_FILE" \
+          --argjson env "$env_json" \
+          --argjson prune "$PRUNE" \
+          --argjson repull "$REPULL" \
+          '{stackFileContent: $content, env: $env, prune: $prune, repullImageAndRedeploy: $repull}')
+
+        curl -sf -X PUT "$PORTAINER_HOST/api/stacks/$stack_id?endpointId=$endpoint_id" \
+          -H "Authorization: Bearer $jwt" \
+          -H "Content-Type: application/json" \
+          -d "$body" -o /dev/null
+        echo "::endgroup::"
+
+        echo "✅ Stack '$STACK_NAME' updated (id=$stack_id, endpoint=$endpoint_id)"
